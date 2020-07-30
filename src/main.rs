@@ -3,11 +3,13 @@
 
 use crate::{bot::setup, db::Database, krate::Crate, util::tryn};
 use arraylib::Slice;
-use carapax::{methods::SendMessage, types::ParseMode, Api};
 use fntools::{self, value::ValueExt};
 use git2::{Delta, Diff, DiffOptions, Repository, Sort};
 use log::info;
 use std::str;
+use teloxide::prelude::{OnError, Request};
+use teloxide::types::ParseMode;
+use teloxide::{Bot, BotBuilder};
 use tokio_postgres::NoTls;
 
 mod bot;
@@ -48,10 +50,9 @@ async fn main() {
             .also(|_| info!("cloning finished"))
     });
 
-    let bot = Api::new(carapax::Config::new(&config.bot_token)).expect("Can't crate Api");
+    let bot = BotBuilder::new().parse_mode(ParseMode::HTML).build();
 
-    let lp = setup(bot.clone(), db.clone(), config.retry_delay);
-    tokio::spawn(lp.run());
+    tokio::spawn(setup(bot.clone(), db.clone()));
 
     loop {
         log::info!("start pulling updates");
@@ -80,7 +81,7 @@ fn fast_forward(repo: &Repository, commit: &git2::Commit) -> Result<(), git2::Er
 
 async fn pull(
     repo: &Repository,
-    bot: &Api,
+    bot: &Bot,
     db: &Database,
     cfg: &cfg::Config,
 ) -> Result<(), git2::Error> {
@@ -189,7 +190,7 @@ fn diff_one(diff: Diff) -> Result<(Crate, ActionKind), git2::Error> {
     }
 }
 
-async fn notify(krate: Crate, action: ActionKind, bot: &Api, db: &Database, cfg: &cfg::Config) {
+async fn notify(krate: Crate, action: ActionKind, bot: &Bot, db: &Database, cfg: &cfg::Config) {
     let message = match action {
         ActionKind::NewVersion => format!(
             "Crate was updated: <code>{krate}#{version}</code> {links}",
@@ -218,39 +219,21 @@ async fn notify(krate: Crate, action: ActionKind, bot: &Api, db: &Database, cfg:
         .unwrap_or_default();
 
     if let Some(ch) = cfg.channel {
-        notify_inner(bot, ch, &message, cfg, &krate, true).await;
+        notify_inner(bot, ch, &message, cfg).await;
     }
 
     for chat_id in users {
-        notify_inner(bot, chat_id, &message, cfg, &krate, false).await;
+        notify_inner(bot, chat_id, &message, cfg).await;
     }
 }
 
-async fn notify_inner(
-    bot: &Api,
-    chat_id: i64,
-    msg: &str,
-    cfg: &cfg::Config,
-    krate: &Crate,
-    quiet: bool,
-) {
-    tryn(5, cfg.retry_delay.0, || {
-        bot.execute(
-            SendMessage::new(chat_id, msg)
-                .parse_mode(ParseMode::Html)
-                .disable_web_page_preview(true)
-                .disable_notification(quiet),
-        )
-    })
-    .await
-    .map(drop)
-    .unwrap_or_else(|err| {
-        log::error!(
-            "error while trying to send notification about {:?} to {}: {}",
-            krate,
-            chat_id,
-            err
-        )
-    });
+async fn notify_inner(bot: &Bot, chat_id: i64, msg: &str, cfg: &cfg::Config) {
+    bot.send_message(chat_id, msg)
+        .disable_web_page_preview(true)
+        .disable_notification(true)
+        .send()
+        .await
+        .log_on_error()
+        .await;
     tokio::time::delay_for(cfg.broadcast_delay_millis.into()).await;
 }
